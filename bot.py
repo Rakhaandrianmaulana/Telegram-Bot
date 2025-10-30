@@ -4,7 +4,7 @@ import utils  # File utilitas kita
 
 from dotenv import load_dotenv
 from telegram import Update, constants
-from telegram.error import BadRequest  # Impor error spesifik
+from telegram.error import BadRequest, TelegramError
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -29,6 +29,18 @@ if not TELEGRAM_TOKEN or not GEMINI_API_KEY:
     logger.error("TELEGRAM_TOKEN atau GEMINI_API_KEY tidak ditemukan di .env file!")
     exit()
 
+# --- (PERUBAHAN DI SINI) ---
+# Konfigurasi Gemini API saat bot pertama kali jalan
+if not utils.configure_gemini(GEMINI_API_KEY):
+    logger.error(
+        "API Key Gemini GAGAL dikonfigurasi. "
+        "Bot akan tetap jalan, tapi perintah /ai akan gagal."
+    )
+else:
+    logger.info("API Key Gemini berhasil dikonfigurasi.")
+# --- (AKHIR PERUBAHAN) ---
+
+
 # --- PENANGAN PERINTAH ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -45,6 +57,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def ai(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Menangani perintah /ai [prompt]."""
+    # (Tidak ada perubahan di fungsi ini, sudah aman)
+    
     user = update.effective_user
     prompt = " ".join(context.args)
 
@@ -55,71 +69,64 @@ async def ai(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    # Kirim pesan "loading"
     loading_msg = await update.message.reply_text("🧠 Sedang memproses permintaan AI Anda... Mohon tunggu.")
     
-    response_text = ""
+    # 1. Dapatkan respon dari API (sekarang pakai library google.genai)
+    response_text = await utils.call_gemini_api(prompt)
+    
+    # 2. Kirim respon
+    
+    # Cek jika ini pesan error dari utils.py
+    if response_text.startswith("ERROR:"):
+        logger.error(f"Fungsi AI mengembalikan error: {response_text}")
+        await loading_msg.edit_text(response_text)
+        return
+
+    # Jika BUKAN error, coba kirim sebagai MARKDOWN
     try:
-        # 1. Panggil API Gemini
-        response_text = await utils.call_gemini_api(prompt, GEMINI_API_KEY)
-        
-        # 2. Coba kirim dengan format MARKDOWN
         await loading_msg.edit_text(response_text, parse_mode=constants.ParseMode.MARKDOWN)
-        
-    except BadRequest as e:
-        # 3. JIKA GAGAL PARSING (Error Anda ada di sini!)
+    
+    except (BadRequest, TelegramError) as e:
+        # JIKA GAGAL PARSING (Error "Can't parse entities")
         if "Can't parse entities" in str(e):
             logger.warning(f"Gagal parse Markdown dari AI: {e}. Mengirim sebagai plain text.")
             try:
-                # 4. Fallback: Kirim sebagai teks biasa (plain text)
+                # Fallback: Kirim sebagai teks biasa (plain text)
                 await loading_msg.edit_text(response_text)
             except Exception as e_fallback:
                 logger.error(f"Gagal mengirim fallback plain text: {e_fallback}")
-                await loading_msg.edit_text("Maaf, terjadi error saat parsing balasan AI dan saat mengirim fallback.")
+                await loading_msg.edit_text("Maaf, terjadi error ganda. Respon AI tidak bisa ditampilkan.")
         else:
-            # Error BadRequest lainnya
-            logger.error(f"BadRequest error: {e}")
-            await loading_msg.edit_text(f"Maaf, terjadi kesalahan (BadRequest): {e}")
+            # Error Telegram lainnya
+            logger.error(f"Error Telegram saat mengirim: {e}")
+            await loading_msg.edit_text(f"Maaf, terjadi kesalahan Telegram: {e}")
             
     except Exception as e:
-        # 5. Error lainnya (misal: API Gemini error, httpx timeout)
-        logger.error(f"Error memanggil Gemini atau error tidak dikenal: {e}")
-        # Kirim error yang lebih spesifik jika response_text kosong
-        if not response_text:
-            await loading_msg.edit_text(f"Maaf, terjadi kesalahan saat menghubungi AI: {e}")
-        else:
-            # Error terjadi saat mengirim, tapi bukan BadRequest
-             await loading_msg.edit_text(f"Terjadi error tak terduga: {e}")
+        # Error lain
+        logger.error(f"Error tidak dikenal saat mengirim pesan: {e}")
+        await loading_msg.edit_text(f"Maaf, terjadi kesalahan tak terduga saat mengirim: {e}")
 
 
 # --- PENANGAN PESAN ---
-
+# (Tidak ada perubahan di sini)
 async def message_counter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Menghitung setiap pesan non-perintah dari pengguna."""
-    # Pastikan itu adalah pesan teks dan bukan dari grup
     if update.message and update.message.text and update.message.chat.type == 'private':
         user = update.effective_user
-        # Update hitungan pesan di database
         utils.update_message_count(user.id, user.username or user.first_name)
 
 # --- PENANGAN TOMBOL (CALLBACK QUERY) ---
-
+# (Tidak ada perubahan di sini)
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Menangani semua klik tombol inline."""
     query = update.callback_query
-    await query.answer()  # Wajib untuk memberitahu Telegram
+    await query.answer()
     
     data = query.data
-    chat_id = query.message.chat_id
-    message_id = query.message.message_id
-    
     user_info = query.from_user
     user = utils.get_user(user_info.id, user_info.username or user_info.first_name)
 
-    # Variabel untuk menampung teks dan keyboard
     text = ""
     keyboard = None
-    parse_mode = constants.ParseMode.MARKDOWN # Default
+    parse_mode = constants.ParseMode.MARKDOWN
 
     if data == "my_info":
         text = (
@@ -149,16 +156,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "Fitur:\n"
             "- Async & Non-blocking\n"
             "- Database JSON (`database.json`)\n"
-* "- Integrasi Gemini AI (via `httpx`)"
+            "- Integrasi Gemini AI (via `google.genai`)" # <-- Diupdate
         )
         keyboard = utils.back_menu_keyboard('main_menu')
 
     elif data == "main_menu":
         text = "Menu Utama:"
         keyboard = utils.main_menu_keyboard()
-        parse_mode = None # Tidak perlu parse mode untuk teks simpel
+        parse_mode = None
 
-    # Kirim/Edit pesan (cukup satu kali di akhir)
     try:
         await query.edit_message_text(
             text, 
@@ -167,32 +173,30 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
     except BadRequest as e:
         if "Message is not modified" in str(e):
-            # Abaikan jika pengguna klik tombol yang sama berulang kali
             pass
         else:
-            logger.warning(f"Error di button_handler: {e}")
-            # Coba kirim tanpa parse mode jika gagal
-            await query.edit_message_text(text, reply_markup=keyboard)
+            logger.warning(f"Error di button_handler (fallback ke plain): {e}")
+            try:
+                await query.edit_message_text(text, reply_markup=keyboard)
+            except Exception as e_fallback:
+                logger.error(f"Gagal fallback button_handler: {e_fallback}")
 
 
 # --- FUNGSI UTAMA ---
-
+# (Tidak ada perubahan di sini)
 def main() -> None:
     """Mulai bot."""
     application = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # Tambahkan penangan
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("ai", ai))
     application.add_handler(CallbackQueryHandler(button_handler))
     
-    # Penangan pesan untuk menghitung pesan (harus setelah perintah)
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, message_counter)
     )
 
     logger.info("Bot sedang berjalan...")
-    # Jalankan bot
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
