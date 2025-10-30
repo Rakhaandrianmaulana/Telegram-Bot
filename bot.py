@@ -4,6 +4,7 @@ import utils  # File utilitas kita
 
 from dotenv import load_dotenv
 from telegram import Update, constants
+from telegram.error import BadRequest  # Impor error spesifik
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -57,16 +58,39 @@ async def ai(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # Kirim pesan "loading"
     loading_msg = await update.message.reply_text("🧠 Sedang memproses permintaan AI Anda... Mohon tunggu.")
     
+    response_text = ""
     try:
-        # Panggil API Gemini (secara asynchronous)
+        # 1. Panggil API Gemini
         response_text = await utils.call_gemini_api(prompt, GEMINI_API_KEY)
         
-        # Edit pesan "loading" dengan hasil
+        # 2. Coba kirim dengan format MARKDOWN
         await loading_msg.edit_text(response_text, parse_mode=constants.ParseMode.MARKDOWN)
         
+    except BadRequest as e:
+        # 3. JIKA GAGAL PARSING (Error Anda ada di sini!)
+        if "Can't parse entities" in str(e):
+            logger.warning(f"Gagal parse Markdown dari AI: {e}. Mengirim sebagai plain text.")
+            try:
+                # 4. Fallback: Kirim sebagai teks biasa (plain text)
+                await loading_msg.edit_text(response_text)
+            except Exception as e_fallback:
+                logger.error(f"Gagal mengirim fallback plain text: {e_fallback}")
+                await loading_msg.edit_text("Maaf, terjadi error saat parsing balasan AI dan saat mengirim fallback.")
+        else:
+            # Error BadRequest lainnya
+            logger.error(f"BadRequest error: {e}")
+            await loading_msg.edit_text(f"Maaf, terjadi kesalahan (BadRequest): {e}")
+            
     except Exception as e:
-        logger.error(f"Error memanggil Gemini: {e}")
-        await loading_msg.edit_text(f"Maaf, terjadi kesalahan saat menghubungi AI: {e}")
+        # 5. Error lainnya (misal: API Gemini error, httpx timeout)
+        logger.error(f"Error memanggil Gemini atau error tidak dikenal: {e}")
+        # Kirim error yang lebih spesifik jika response_text kosong
+        if not response_text:
+            await loading_msg.edit_text(f"Maaf, terjadi kesalahan saat menghubungi AI: {e}")
+        else:
+            # Error terjadi saat mengirim, tapi bukan BadRequest
+             await loading_msg.edit_text(f"Terjadi error tak terduga: {e}")
+
 
 # --- PENANGAN PESAN ---
 
@@ -92,22 +116,23 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user_info = query.from_user
     user = utils.get_user(user_info.id, user_info.username or user_info.first_name)
 
+    # Variabel untuk menampung teks dan keyboard
+    text = ""
+    keyboard = None
+    parse_mode = constants.ParseMode.MARKDOWN # Default
+
     if data == "my_info":
-        info_text = (
+        text = (
             f"--- Info Akun Anda ---\n\n"
             f"👤 **Username:** @{user.get('username', 'N/A')}\n"
             f"🔢 **User ID:** `{user.get('id')}`\n"
             f"💬 **Total Pesan:** {user.get('message_count', 0)}\n"
             f"🗓 **Terdaftar:** {user.get('registered_at', 'N/A').split('T')[0]}"
         )
-        await query.edit_message_text(
-            info_text, 
-            reply_markup=utils.back_menu_keyboard('main_menu'),
-            parse_mode=constants.ParseMode.MARKDOWN
-        )
+        keyboard = utils.back_menu_keyboard('main_menu')
 
     elif data == "ai_help":
-        ai_help_text = (
+        text = (
             "**Bantuan Fitur AI (Gemini)**\n\n"
             "Kirim perintah dengan format:\n"
             "`/ai [pertanyaan Anda]`\n\n"
@@ -115,32 +140,40 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "`/ai Siapa penemu Python?`\n\n"
             "Bot akan merespon dengan jawaban yang dihasilkan oleh AI."
         )
-        await query.edit_message_text(
-            ai_help_text, 
-            reply_markup=utils.back_menu_keyboard('main_menu'),
-            parse_mode=constants.ParseMode.MARKDOWN
-        )
+        keyboard = utils.back_menu_keyboard('main_menu')
 
     elif data == "about_bot":
-        about_text = (
+        text = (
             "**Bot Canggih v1.0 (Python)**\n\n"
             "Dibuat dengan `python-telegram-bot`.\n"
             "Fitur:\n"
             "- Async & Non-blocking\n"
             "- Database JSON (`database.json`)\n"
-            "- Integrasi Gemini AI (via `httpx`)"
+* "- Integrasi Gemini AI (via `httpx`)"
         )
-        await query.edit_message_text(
-            about_text, 
-            reply_markup=utils.back_menu_keyboard('main_menu'),
-            parse_mode=constants.ParseMode.MARKDOWN
-        )
+        keyboard = utils.back_menu_keyboard('main_menu')
 
     elif data == "main_menu":
+        text = "Menu Utama:"
+        keyboard = utils.main_menu_keyboard()
+        parse_mode = None # Tidak perlu parse mode untuk teks simpel
+
+    # Kirim/Edit pesan (cukup satu kali di akhir)
+    try:
         await query.edit_message_text(
-            "Menu Utama:", 
-            reply_markup=utils.main_menu_keyboard()
+            text, 
+            reply_markup=keyboard,
+            parse_mode=parse_mode
         )
+    except BadRequest as e:
+        if "Message is not modified" in str(e):
+            # Abaikan jika pengguna klik tombol yang sama berulang kali
+            pass
+        else:
+            logger.warning(f"Error di button_handler: {e}")
+            # Coba kirim tanpa parse mode jika gagal
+            await query.edit_message_text(text, reply_markup=keyboard)
+
 
 # --- FUNGSI UTAMA ---
 
@@ -164,3 +197,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
